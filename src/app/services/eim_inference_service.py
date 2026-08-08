@@ -8,10 +8,13 @@ from typing import Any
 import cv2  # type: ignore[import-not-found]
 import numpy as np
 
-from src.app.domain.entities import BoundingBox, InferenceResult
+from src.app.domain.entities import BoundingBox, InferenceResult, ModelViewport
 from src.app.utils.logger import get_logger
 
 LOGGER = get_logger(__name__)
+
+# Studio resize mode we can reproduce with a cheap centre crop before scaling.
+RESIZE_MODE_FIT_SHORTEST = "fit-shortest"
 
 try:
     # Official Edge Impulse Linux image runner for .eim models.
@@ -37,6 +40,7 @@ class EimInferenceService:
         self._runner: Any | None = None
         self._model_info: dict[str, Any] | None = None
         self._input_frame_size: tuple[int, int] | None = None
+        self._resize_mode: str | None = None
 
     @property
     def model_info(self) -> dict[str, Any] | None:
@@ -47,6 +51,11 @@ class EimInferenceService:
     def input_frame_size(self) -> tuple[int, int] | None:
         """Return expected model input frame size as (width, height), if known."""
         return self._input_frame_size
+
+    @property
+    def resize_mode(self) -> str | None:
+        """Return the Studio resize mode the model was trained with."""
+        return self._resize_mode
 
     def start(self) -> None:
         """Initialize runner and load .eim model."""
@@ -71,39 +80,54 @@ class EimInferenceService:
             ) from exc
 
         self._input_frame_size = _extract_input_size_from_model_info(self._model_info)
+        self._resize_mode = _extract_resize_mode(self._model_info)
 
         if self._input_frame_size is not None:
             LOGGER.info(
-                "Edge Impulse model initialized (input=%sx%s).",
+                "Edge Impulse model initialized (input=%sx%s, resize_mode=%s).",
                 self._input_frame_size[0],
                 self._input_frame_size[1],
+                self._resize_mode or "unknown",
             )
         else:
             LOGGER.info(
                 "Edge Impulse model initialized (input shape unavailable in metadata)."
             )
 
-    def infer(self, frame_bgr: Any) -> InferenceResult:
-        """Run inference on a BGR frame and normalize object detection output."""
+    def preprocess(self, frame_bgr: Any) -> tuple[Any, Any, ModelViewport | None]:
+        """Turn a BGR frame into model features.
+
+        Returns ``(features, model_frame, viewport)``. Split out of :meth:`infer`
+        so the pipeline can time preprocessing and inference independently —
+        the .eim runner only reports its own native time, which hides this cost.
+        """
         if self._runner is None:
             raise InferenceExecutionError("Inference runner is not initialized.")
 
-        # Stage 1: OpenCV camera frames are BGR; Edge Impulse expects RGB image input.
         try:
-            frame_rgb = cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB)
-            frame_rgb = np.ascontiguousarray(frame_rgb)
+            # Downscale first, convert colour second. The full-resolution
+            # BGR->RGB copy was pure waste: everything downstream only ever
+            # looks at a 96x96 view of the frame.
+            model_input, viewport = self._downscale_for_model(frame_bgr)
+            frame_rgb = np.ascontiguousarray(
+                cv2.cvtColor(model_input, cv2.COLOR_BGR2RGB)
+            )
         except Exception as exc:  # pragma: no cover - external runtime dependency
             raise InferenceExecutionError(
                 "Edge Impulse inference failed during RGB preprocessing."
             ) from exc
 
-        # Stage 2: Convert image into model features using the SDK helper.
         try:
-            features_result = self._runner.get_features_from_image(frame_rgb)
+            # The auto/studio helper encodes features with vectorized numpy and
+            # applies the same resize mode used during training. The legacy
+            # get_features_from_image() loops over every pixel in Python.
+            features_result = self._runner.get_features_from_image_auto_studio_settings(
+                frame_rgb
+            )
         except Exception as exc:  # pragma: no cover - external runtime dependency
             raise InferenceExecutionError(
                 "Edge Impulse inference failed during feature extraction "
-                "(runner.get_features_from_image)."
+                "(runner.get_features_from_image_auto_studio_settings)."
             ) from exc
 
         features: Any
@@ -114,7 +138,18 @@ class EimInferenceService:
         else:
             features = features_result
 
-        # Stage 3: Run classification/detection over extracted features.
+        return features, model_frame, viewport
+
+    def classify(
+        self,
+        features: Any,
+        model_frame: Any | None = None,
+        viewport: ModelViewport | None = None,
+    ) -> InferenceResult:
+        """Run detection over already-extracted features."""
+        if self._runner is None:
+            raise InferenceExecutionError("Inference runner is not initialized.")
+
         try:
             output = self._runner.classify(features)
         except Exception as exc:  # pragma: no cover - external runtime dependency
@@ -127,14 +162,64 @@ class EimInferenceService:
                 "Unexpected inference output format from Edge Impulse runner."
             )
 
-        latency_ms = _extract_latency_ms(output)
-        boxes = _extract_bounding_boxes(output, min_confidence=self._min_confidence)
         return InferenceResult(
-            boxes=boxes,
-            latency_ms=latency_ms,
+            boxes=_extract_bounding_boxes(
+                output, min_confidence=self._min_confidence
+            ),
+            latency_ms=_extract_latency_ms(output),
             raw=output,
             model_frame=model_frame,
+            viewport=viewport,
         )
+
+    def infer(self, frame_bgr: Any) -> InferenceResult:
+        """Run inference on a BGR frame and normalize object detection output."""
+        features, model_frame, viewport = self.preprocess(frame_bgr)
+        return self.classify(features, model_frame=model_frame, viewport=viewport)
+
+    def _downscale_for_model(
+        self, frame_bgr: Any
+    ) -> tuple[Any, ModelViewport | None]:
+        """Reduce the frame to model input size before any per-pixel work.
+
+        For ``fit-shortest`` this reproduces the SDK's own crop-and-scale, so
+        the features are unchanged, and it yields the viewport needed to map
+        detections back onto the full frame. Any other resize mode is left to
+        the SDK untouched rather than guessed at.
+        """
+        if self._input_frame_size is None or self._resize_mode != RESIZE_MODE_FIT_SHORTEST:
+            return frame_bgr, None
+
+        model_w, model_h = self._input_frame_size
+        height, width = frame_bgr.shape[:2]
+        if width <= 0 or height <= 0:
+            return frame_bgr, None
+
+        # fit-shortest keeps the largest centred region matching the model
+        # aspect ratio, then scales it down.
+        aspect = model_w / float(model_h)
+        if width / float(height) > aspect:
+            region_w = int(height * aspect)
+            region_h = height
+        else:
+            region_w = width
+            region_h = int(width / aspect)
+
+        offset_x = (width - region_w) // 2
+        offset_y = (height - region_h) // 2
+        # Slicing produces a view, so the crop itself costs nothing.
+        region = frame_bgr[offset_y : offset_y + region_h, offset_x : offset_x + region_w]
+        scaled = cv2.resize(region, (model_w, model_h), interpolation=cv2.INTER_AREA)
+
+        viewport = ModelViewport(
+            model_width=model_w,
+            model_height=model_h,
+            offset_x=offset_x,
+            offset_y=offset_y,
+            region_width=region_w,
+            region_height=region_h,
+        )
+        return scaled, viewport
 
     def stop(self) -> None:
         """Release runner resources."""
@@ -148,6 +233,7 @@ class EimInferenceService:
         finally:
             self._runner = None
             self._input_frame_size = None
+            self._resize_mode = None
 
 
 def _extract_bounding_boxes(
@@ -192,6 +278,20 @@ def _extract_latency_ms(output: dict[str, Any]) -> float | None:
             return float(timing["dsp"]) + float(timing["classification"])
         except (TypeError, ValueError):
             return None
+
+    return None
+
+
+def _extract_resize_mode(model_info: dict[str, Any] | None) -> str | None:
+    """Read the Studio resize mode from runner metadata when reported."""
+    if not isinstance(model_info, dict):
+        return None
+
+    model_parameters = model_info.get("model_parameters")
+    if isinstance(model_parameters, dict):
+        mode = model_parameters.get("image_resize_mode")
+        if isinstance(mode, str) and mode and mode != "not-reported":
+            return mode
 
     return None
 
