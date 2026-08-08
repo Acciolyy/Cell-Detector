@@ -294,7 +294,13 @@ A aplicação faz tratamento defensivo para falhas de inicialização, ausência
 - O modo de resize é `fit-shortest`: o modelo enxerga apenas o **quadrado
   central** do quadro. Objetos nas bordas laterais ficam fora do campo de visão
   da detecção, mesmo estando visíveis na imagem exibida.
-- A capacidade de generalização ainda é limitada: variações de iluminação, ângulo da câmera, oclusões parciais e contexto de fundo podem alterar significativamente a confiança da detecção.
+- O modelo detecta de forma consistente quando o celular está próximo à orelha,
+  mas frequentemente falha quando o aparelho está visível em outras posições
+  (altura do peito, tela voltada para a câmera), mesmo com boa iluminação e sem
+  obstrução. Isso indica que o modelo aprendeu a associar a classe "celular" ao
+  contexto de uso (mão próxima à cabeça) mais do que às características visuais
+  do objeto isoladamente — um viés esperado dado que o dataset de treino
+  provavelmente super-representa essa pose.
 - A qualidade final depende fortemente do dataset (diversidade de cenários, balanceamento de classes e qualidade de anotação).
 - Bounding boxes podem ficar imprecisas em objetos pequenos, movimentos rápidos e enquadramentos fora do padrão de treino.
 
@@ -308,6 +314,9 @@ O modelo `.eim` atual deve ser considerado um **protótipo experimental**.
 
 ## 🧠 Roadmap de melhoria
 
+- Adicionar exemplos de celular em posições variadas (altura do peito, tela
+  voltada para a câmera, parcialmente visível) para reduzir o viés de pose
+  identificado em teste.
 - Expandir o dataset com maior diversidade de iluminação, câmera, ângulos e perfis de condutor.
 - Melhorar a qualidade das anotações para tornar as bounding boxes mais consistentes.
 - Incluir mais exemplos negativos (mão no rosto, objetos parecidos, gestos sem celular) para reduzir falsos positivos.
