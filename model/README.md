@@ -1,12 +1,16 @@
 # Model Folder
 
-Coloque aqui o arquivo do modelo Edge Impulse no formato `.eim`.
+O modelo Edge Impulse (`cellphone_detector.eim`) já vem neste repositório.
+Depois de clonar, só é preciso garantir a permissão de execução:
 
-Exemplo:
+```bash
+chmod +x model/cellphone_detector.eim
+```
 
-`model/phone-usage-detector.eim`
+O SDK executa o `.eim` como subprocesso e conversa com ele por socket, por isso
+o bit de execução é necessário.
 
-Observacoes:
+Observações:
 
-- Este projeto espera um modelo compilado para Linux x86_64.
-- Nao usar formato TFLite/PyTorch/ONNX neste projeto.
+- O modelo é compilado para Linux x86_64.
+- Não usar formato TFLite/PyTorch/ONNX neste projeto.
