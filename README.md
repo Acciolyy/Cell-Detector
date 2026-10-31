@@ -32,11 +32,11 @@ Ganho de 2,99x no total. Esses números foram medidos com **câmera emulada** (o
 ## Como funciona
 
 ```mermaid
-flowchart LR
-    A[Câmera ou arquivo de vídeo] --> B[Pré-processamento]
-    B --> C[Inferência .eim]
-    C --> D[Desenho das caixas e HUD]
-    D --> E[Janela e/ou gravação mp4]
+flowchart TD
+    A["Câmera ou arquivo de vídeo"] --> B["Pré-processamento"]
+    B --> C["Inferência (.eim)"]
+    C --> D["Desenho das caixas e HUD"]
+    D --> E["Janela e/ou gravação mp4"]
 ```
 
 Cada etapa é cronometrada separadamente pelo `FrameProfiler`. A fonte de vídeo roda numa thread produtora. O pré-processamento reduz o quadro para a entrada do modelo (96x96) antes de converter a cor. A inferência chama o runner `.eim`. O desenho aplica as caixas sobre o quadro original e mostra FPS e tempos no HUD.
