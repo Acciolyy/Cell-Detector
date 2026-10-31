@@ -1,7 +1,6 @@
 # Examples Assets
 
-Arquivos de exemplo para demonstracao do projeto:
+Arquivos de exemplo para demonstração do projeto:
 
-- capturas de tela
-- gifs curtos
-- imagens de saida com bounding boxes
+- `demo.gif`: animação curta da detecção em vídeo real
+- `foto1.png`, `foto2.png`: capturas com bounding boxes
