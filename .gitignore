@@ -41,6 +41,7 @@ Thumbs.db
 /*.mp4
 /*.avi
 /*.mkv
+/*.webm
 
 # Local environment overrides
 .env
