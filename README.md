@@ -1,344 +1,131 @@
 # edge-phone-usage-detector
 
-Aplicação de visão computacional em tempo real para detecção de uso de celular via webcam, com foco em cenários de segurança no trânsito e monitoramento de comportamento do condutor.
+![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-3776AB?logo=python&logoColor=white)
+![OpenCV](https://img.shields.io/badge/OpenCV-5C3EE8?logo=opencv&logoColor=white)
+![Edge Impulse](https://img.shields.io/badge/Edge%20Impulse-.eim-00A3A1)
+![CI](https://github.com/Acciolyy/Cell-Detector/actions/workflows/ci.yml/badge.svg)
 
-O projeto utiliza um modelo treinado no Edge Impulse no formato **`.eim` (Linux x86_64)**.
+Detecção de uso de celular em tempo real, com um modelo do Edge Impulse (`.eim`) e OpenCV. Otimizei a pipeline de cerca de 10 para cerca de 30 FPS, medido com `--profile-frames` e câmera emulada.
 
-## 📸 Demo
+![Demo da detecção](assets/examples/demo.gif)
 
-Exemplos de detecção em tempo real:
+## Por que fiz
 
-![Demo 1](assets/examples/foto1.png)
-![Demo 2](assets/examples/foto2.png)
-![Demo 3](assets/examples/foto3.png)
-![Demo 4](assets/examples/foto4.png)
+É meu primeiro projeto de visão computacional na borda, feito a partir de um curso que fiz há bastante tempo.
 
-## Problema que o projeto resolve
+Escolhi detectar uso de celular ao volante para dar um propósito ao projeto. Não é uma pesquisa em segurança no trânsito, e não trato o caso de uso como mais do que isso.
 
-Uso de celular ao volante é um fator recorrente em acidentes e quase-acidentes, principalmente por reduzir tempo de reação e atenção situacional do condutor. Este projeto demonstra uma pipeline de visão computacional em tempo real para detecção desse comportamento, servindo como base técnica para protótipos de monitoramento em cabine, validação de regras de segurança e estudos de assistência ao motorista.
+O modelo é o menos importante aqui. Usei o Edge Impulse para chegar rápido a um modelo funcionando. O que o projeto mostra de fato é a engenharia em volta dele (pipeline em camadas, fonte de vídeo, tratamento de erros, testes) e a investigação de desempenho.
 
-## Tecnologias
+## Resultado
 
-- Python 3.10+
-- OpenCV (`opencv-python`)
-- NumPy
-- Edge Impulse Linux Python SDK / runtime compatível com `.eim` (instalação pode variar por ambiente)
+| | Antes | Depois |
+| --- | ---: | ---: |
+| FPS efetivo | 10,03 | 29,94 |
+| Tempo do quadro | 99,72 ms | 33,39 ms |
 
-## Estrutura do projeto
+Ganho de 2,99x no total. Esses números foram medidos com **câmera emulada** (o WSL não tem webcam). Detalhes em [Desafios](#desafios-e-o-que-aprendi).
 
-```text
-.
-├── assets/examples/          # Mídias para demonstração (prints/gifs)
-├── docs/ARCHITECTURE.md      # Arquitetura técnica e fluxo
-├── model/                    # Pasta do modelo Edge Impulse .eim
-├── scripts/run_dev.sh        # Script de execução local
-├── src/
-│   ├── main.py               # Entrypoint
-│   └── app/
-│       ├── config/           # Configurações
-│       ├── domain/           # Entidades de domínio
-│       ├── services/         # Câmera, inferência e pipeline
-│       └── utils/            # Logging e paths
-├── tests/                    # Testes básicos
-├── requirements.txt          # Dependências Python base (sem runtime Edge Impulse fixo)
-└── .gitignore
+![Detecção 1](assets/examples/foto1.png)
+![Detecção 2](assets/examples/foto2.png)
+
+## Como funciona
+
+```mermaid
+flowchart LR
+    A[Câmera ou arquivo de vídeo] --> B[Pré-processamento]
+    B --> C[Inferência .eim]
+    C --> D[Desenho das caixas e HUD]
+    D --> E[Janela e/ou gravação mp4]
 ```
 
-## Instalação
+Cada etapa é cronometrada separadamente pelo `FrameProfiler`. A fonte de vídeo roda numa thread produtora. O pré-processamento reduz o quadro para a entrada do modelo (96x96) antes de converter a cor. A inferência chama o runner `.eim`. O desenho aplica as caixas sobre o quadro original e mostra FPS e tempos no HUD.
 
-### 1) Criar ambiente virtual
+O código está em camadas: `config`, `domain`, `services` e `utils`. Os detalhes estão em [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md).
 
-```bash
-python3 -m venv .venv
-```
+## Decisões técnicas
 
-### 2) Ativar ambiente virtual
+**1. Captura a 640x480.**
+O modelo recebe 96x96, então capturar mais não acrescenta precisão. A 1280x720 em YUYV, cada quadro tem 1,84 MB e o USB 2.0 limita a entrega a cerca de 10 fps. Alternativa: manter 720p e pedir MJPG, que remove o limite de banda, mas troca banda por custo de decodificação e nem todo driver aceita (existe a flag `--camera-fourcc` para testar).
 
-```bash
-source .venv/bin/activate
-```
+**2. Thread produtora com slot único.**
+O `cap.read()` bloqueia até a câmera entregar. Executado dentro do laço, ele faz toda a pipeline andar no ritmo da câmera. Na thread, o produtor guarda só o quadro mais recente e descarta o anterior. Alternativa: uma fila. Em tempo real um quadro velho não tem valor, e a fila só acumularia latência.
 
-### 3) Instalar dependências base
+**3. `FrameSource` com duas classes, não uma com flags.**
+`ThreadedFrameSource` (webcam) descarta quadros atrasados. `VideoFileFrameSource` usa uma fila bloqueante e não descarta nada, porque um quadro perdido de um arquivo é conteúdo perdido. As duas diferem justamente no que fazer com um quadro que o consumidor não alcançou. Alternativa: uma classe com um modo por flag, misturando as duas políticas.
 
-```bash
-pip install --upgrade pip
-pip install -r requirements.txt
-```
+**4. Pré-processamento vetorizado.**
+A função `get_features_from_image` do SDK percorre os 9.216 pixels num laço Python. Uso `get_features_from_image_auto_studio_settings`, que é vetorizada com numpy. Reduzo a imagem antes de converter a cor, e o recorte `fit-shortest` é reproduzido para mapear as caixas de volta ao quadro. A 640x480, as features saem idênticas byte a byte às da versão antiga.
 
-### 4) Instalar runtime Edge Impulse compatível com `.eim`
+**5. Medir cada etapa, em vez de confiar na latência do runner.**
+O tempo que o runner `.eim` reporta cobre só a rede nativa. Cronometrar cada etapa do laço foi o que mostrou onde o tempo realmente ia. Alternativa: usar o número do runner como indicador de FPS, que é o que gerava a leitura enganosa descrita abaixo.
 
-A parte de inferência `.eim` depende de runtime/SDK Edge Impulse disponível no seu Linux. O nome exato do pacote e versão podem variar.
+## Desafios e o que aprendi
 
-Exemplo comum (quando disponível no seu ambiente):
+### Desempenho: de ~10 para ~30 FPS
 
-```bash
-pip install edge_impulse_linux
-```
+No notebook que eu usava na época, as imagens saíam com qualidade ruim e o FPS era baixo. Isso foi só o contexto que motivou a investigação: não tem medição associada.
 
-Se esse pacote não estiver disponível para sua plataforma, consulte a documentação oficial do Edge Impulse para Linux e instale o runner Python equivalente.
+O runner reportava cerca de 4 ms de inferência, enquanto a tela mostrava 3 a 8 FPS. Os dois números não fechavam. Esse tempo cobre só a rede nativa (~1 ms medido aqui), sem extração de features, IPC, desenho nem exibição. Em vez de confiar nele, cronometrei cada etapa do laço.
 
-## Modelo `.eim`
-
-Coloque o modelo em:
-
-```bash
-model/cellphone_detector.eim
-```
-
-Observações:
-
-- Este projeto **não** trata o modelo como TFLite/ONNX/PyTorch.
-- A inferência é feita por runtime Edge Impulse compatível com `.eim`.
-
-## Como rodar
-
-### Opção 1: script
-
-```bash
-bash scripts/run_dev.sh
-```
-
-### Opção 2: comando direto
-
-```bash
-python -m src.main \
-  --model-path model/cellphone_detector.eim \
-  --camera-index 0 \
-  --camera-width 640 \
-  --camera-height 480 \
-  --min-confidence 0.5
-```
-
-Controles:
-
-- `q` para encerrar.
-
-> O modelo recebe 96x96. Capturar acima de 640x480 não acrescenta precisão e
-> consome banda USB, que é justamente o gargalo do laço — veja
-> [Desempenho](#desempenho).
-
-### Opção 3: a partir de um arquivo de vídeo
-
-Útil onde não há webcam exposta — WSL2, por exemplo, não traz V4L2/UVC no
-kernel — e para validar a pipeline sobre material gravado externamente.
-
-```bash
-python -m src.main --source entrada.mp4 --record anotado.mp4
-```
-
-Nesse modo as opções `--camera-*` são ignoradas (com aviso no log), e a
-diferença de comportamento em relação à webcam é intencional:
-
-| | Webcam ao vivo | Arquivo |
-| --- | --- | --- |
-| Quadros atrasados | Descartados (só o mais recente importa) | Nenhum descarte: todos processados em ordem |
-| Fim da fonte | Não existe; encerra com `q` | Encerra sozinho, sem erro |
-| FPS da gravação | Taxa de processamento medida | Herdado do arquivo de entrada |
-| Etapa no profiling | `capture` | `decode` |
-
-O FPS de saída herda o da entrada de propósito: gravar no ritmo de
-processamento faria a demonstração sair acelerada ou lenta. Se o container
-reportar um FPS inválido, o fallback é 30 e fica registrado no log.
-
-### Gravar vídeo de demonstração
-
-Grava os quadros já anotados direto em mp4, no FPS real medido. Sem screen
-recording: não há barra de título, cursor nem borda de janela no resultado.
-
-```bash
-python -m src.main --record demo.mp4
-```
-
-Para gerar material em modo headless (também útil para medir quanto o `imshow`
-está custando):
-
-```bash
-python -m src.main --record demo.mp4 --no-display
-```
-
-### Medir o desempenho
-
-Processa exatamente N quadros e imprime média, mediana e p95 de cada etapa do
-laço, mais o FPS efetivo:
-
-```bash
-python -m src.main --profile-frames 200
-```
-
-```text
-stage              n   mean ms   median ms    p95 ms    share
--------------------------------------------------------------
-capture          200     20.20       20.65     23.40    60.5%
-preprocess       200      1.49        1.46      2.18     4.5%
-inference        200      2.83        2.61      3.73     8.5%
-draw             200      0.31        0.27      0.51     0.9%
-display          200      5.11        4.89      6.60    15.3%
--------------------------------------------------------------
-frame total      200     33.39       33.31     36.61   100.0%
-```
-
-### Flags adicionais
-
-| Flag | Efeito |
-| --- | --- |
-| `--source CAMINHO` | Lê quadros de um arquivo de vídeo em vez da webcam. |
-| `--record CAMINHO.mp4` | Grava os quadros anotados. FPS medido para webcam, FPS da entrada para arquivo. |
-| `--no-display` | Roda sem janela OpenCV (headless). Exige `--record` ou `--profile-frames`. |
-| `--profile-frames N` | Processa N quadros, imprime o relatório de etapas e sai. |
-| `--camera-fourcc MJPG` | Formato de captura. Útil quando o driver escolhe YUYV e limita o frame rate. |
-| `--fps-window N` | Quadros usados na média móvel de FPS do overlay (padrão 30). |
-
-## Desempenho
-
-O overlay mostra apenas números medidos por este laço:
-
-- FPS por média móvel dos últimos 30 quadros, não instantâneo.
-- Tempo total do quadro em ms.
-- Decomposição: captura / inferência / render.
-
-A latência que o runner `.eim` reporta (`timing.dsp + timing.classification`)
-cobre **só a rede nativa** — medida aqui em ~1 ms. Ela não inclui extração de
-features, IPC, desenho nem exibição, e por isso não serve como indicador de
-FPS. Foi essa a origem da leitura de "4 ms de inferência" convivendo com 3–8
-FPS na tela.
-
-### Antes/depois
-
-Medido com 200 quadros, i5-1335U, runner `.eim` real, câmera emulada com o
-mesmo período nos dois lados (10 fps a 1280x720 e 30 fps a 640x480, tetos
-típicos de YUYV em USB 2.0):
+A tabela abaixo foi medida com 200 quadros num i5-1335U, com o runner `.eim` real e câmera emulada:
 
 | Etapa | Antes | Depois | Ganho |
 | --- | ---: | ---: | ---: |
-| captura | 78.88 ms | 20.20 ms | 3.90x |
-| pré-processamento | 9.19 ms | 1.49 ms | 6.19x |
-| inferência | 2.99 ms | 2.83 ms | 1.06x |
-| desenho | 0.56 ms | 0.31 ms | 1.83x |
-| exibição | 8.02 ms | 5.11 ms | 1.57x |
-| **total do quadro** | **99.72 ms** | **33.39 ms** | **2.99x** |
-| **FPS efetivo** | **10.03** | **29.94** | **2.99x** |
+| captura | 78,88 ms | 20,20 ms | 3,90x |
+| pré-processamento | 9,19 ms | 1,49 ms | 6,19x |
+| inferência | 2,99 ms | 2,83 ms | 1,06x |
+| desenho | 0,56 ms | 0,31 ms | 1,83x |
+| exibição | 8,02 ms | 5,11 ms | 1,57x |
+| **total do quadro** | **99,72 ms** | **33,39 ms** | **2,99x** |
+| **FPS efetivo** | **10,03** | **29,94** | **2,99x** |
+
+**Ressalva importante:** o WSL não tem webcam, então a captura foi **emulada**, com o mesmo período dos dois lados (10 fps a 1280x720 e 30 fps a 640x480, tetos típicos de YUYV em USB 2.0). Pré-processamento, inferência, desenho e exibição são medições reais. O tempo de captura é um período fixo, não uma medição de webcam. Para o número do seu hardware, rode `python -m src.main --profile-frames 200`.
 
 O que cada correção resolveu:
 
-- **Resolução de captura 1280x720 → 640x480.** Origem do maior ganho. A 720p
-  em YUYV cada quadro custa 1,84 MB e o barramento USB 2.0 limita a entrega a
-  ~10 fps; o `cap.read()` passa o tempo todo bloqueado esperando a câmera.
-- **`get_features_from_image_auto_studio_settings` no lugar de
-  `get_features_from_image`.** A função antiga do SDK percorre os 9.216 pixels
-  em loop Python. A vetorizada usa numpy e aplica o mesmo `fit-shortest` do
-  treino. A 640x480 as features saem idênticas byte a byte.
-- **Downscale antes da conversão de cor.** O `cvtColor` rodava sobre o quadro
-  inteiro para alimentar um modelo 96x96.
-- **Thread produtora com slot único + `CAP_PROP_BUFFERSIZE=1`.** Não aumenta
-  FPS quando o consumidor já é mais rápido que a câmera: o que compra é
-  frescor. Sem isso, a fila do driver entrega quadros capturados vários
-  períodos atrás e a latência acumula. O produtor descarta o quadro anterior
-  em vez de enfileirar, então o laço sempre processa o mais recente.
+- **Resolução de captura 1280x720 → 640x480.** Maior ganho. A 720p o `cap.read()` passava o tempo bloqueado esperando a câmera.
+- **Pré-processamento vetorizado.** Tirou o laço Python sobre os 9.216 pixels.
+- **Downscale antes da conversão de cor.** O `cvtColor` rodava sobre o quadro inteiro para alimentar um modelo 96x96.
+- **Thread produtora com slot único e `CAP_PROP_BUFFERSIZE=1`.** Não aumenta o FPS quando o consumidor já é mais rápido que a câmera. O que compra é frescor: sem isso a fila do driver entrega quadros capturados vários períodos atrás.
 
-## Integração `.eim` no projeto
+Depois disso, a captura ainda ocupa cerca de 60% do quadro, e é espera pela câmera. O resto do laço custa cerca de 13 ms. O teto passou a ser o frame rate que a webcam negocia, não o software.
 
-`EimInferenceService` tenta usar `ImageImpulseRunner` via SDK Python do Edge Impulse para:
+### Viés de pose: o que o teste com vídeo real mostrou
 
-1. Inicializar o modelo `.eim` no Linux.
-2. Converter frame de BGR para RGB.
-3. Executar inferência por frame.
-4. Ler `result.bounding_boxes` e normalizar saída para o pipeline.
+Ao testar com vídeo real, o modelo detectou o celular de forma consistente perto da orelha. Falhou quando o aparelho estava em outras posições, como na altura do peito ou com a tela voltada para a câmera, mesmo com boa iluminação e sem obstrução.
 
-A aplicação faz tratamento defensivo para falhas de inicialização, ausência de runtime e resposta inesperada do runner.
+Interpreto como um reflexo do dataset: o modelo parece ter associado "celular" ao contexto da mão perto da cabeça, mais do que às características visuais do objeto. Não tenho acesso aos detalhes do dataset para confirmar. O viés de pose mostra que um modelo pode funcionar bem nos casos de teste e ainda assim ter aprendido a pista errada.
 
-## Tratamento de erros implementado
+O modelo também é limitado por coisas que não aparecem no código, como a entrada de 96x96 em grayscale e o recorte central. Do lado do desempenho, medir cada etapa evitou otimizar o lugar errado.
 
-- Webcam indisponível.
-- Arquivo `.eim` ausente ou inválido.
-- Falha ao inicializar runtime Edge Impulse.
-- Erro durante inferência.
-- Dependências ausentes.
+## Limitações e próximos passos
 
-## Limitações técnicas reais
+**Limitações**
 
-### Desempenho
+- **É um protótipo experimental.** A pipeline de software está funcional. As limitações vêm do modelo.
+- **Viés de pose**, descrito acima.
+- **Entrada 96x96 em grayscale** (1 canal): pouco detalhe espacial, o que pode piorar a precisão das caixas.
+- **Recorte central** (`fit-shortest`): o modelo enxerga só o quadrado central do quadro. Objetos nas bordas laterais ficam fora da detecção, mesmo visíveis na imagem.
+- **Sem métricas formais.** O modelo foi treinado no Edge Impulse e não tenho números de treino para citar.
+- **Medição com câmera emulada**, como explicado em Desafios.
+- O FPS é limitado pela câmera, não pela inferência.
 
-- **O FPS é limitado pela câmera, não pela inferência.** Depois das correções, a
-  captura ainda responde por ~60% do tempo do quadro, e esse tempo é espera
-  pelo próximo quadro do driver. Todo o resto do laço custa ~13 ms, ou seja,
-  o software sozinho comportaria ~75 FPS. Na prática o teto é o frame rate que
-  a webcam negocia.
-- **Webcams USB 2.0 em YUYV são o caso ruim.** A 1280x720 o barramento limita a
-  entrega a cerca de 10 fps. Se a sua câmera suportar MJPG, `--camera-fourcc
-  MJPG` remove esse limite às custas de decodificação; nem todo driver aceita.
-- **`imshow` custa ~5 ms por quadro** e é a etapa de software mais cara que
-  sobrou. Medido sob WSLg/X11, onde o overhead é maior que em sessão nativa.
-  `--no-display` elimina esse custo para gravação e medição.
-- Os números de antes/depois em [Desempenho](#desempenho) foram medidos num
-  i5-1335U com o runner `.eim` real, mas com **câmera emulada** — não havia
-  webcam no ambiente de medição. Os custos de pré-processamento, inferência,
-  desenho e exibição são medições reais; a captura usa um período fixo baseado
-  nos tetos típicos de USB 2.0. Para o número real do seu hardware, rode
-  `python -m src.main --profile-frames 200`.
-- `CAP_PROP_BUFFERSIZE` é uma sugestão: vários backends a ignoram
-  silenciosamente. A thread produtora com descarte cobre esse caso.
-- A gravação buffeiriza os primeiros 30 quadros para descobrir o FPS real antes
-  de abrir o `VideoWriter`. Numa cena com frame rate muito instável, o arquivo
-  fica com um FPS fixo que representa a média, não a variação.
+**Próximos passos**
 
-### Modelo
+O próximo projeto vai usar um modelo treinado por mim, sem Edge Impulse, com dataset e métricas próprios.
 
-- O runtime `.eim` depende de suporte da plataforma Linux e bibliotecas nativas.
-- O arquivo `.eim` precisa ter permissão de execução (`chmod +x`), porque o SDK
-  o executa como subprocesso e conversa por socket. O git não preserva esse bit
-  em todos os fluxos de clone.
-- Metadados de modelo (`model_info`) podem variar por versão do SDK.
-- O modelo atual foi treinado com entrada reduzida (96x96, **1 canal —
-  grayscale**), o que limita detalhe espacial e pode degradar a precisão das
-  bounding boxes.
-- O modo de resize é `fit-shortest`: o modelo enxerga apenas o **quadrado
-  central** do quadro. Objetos nas bordas laterais ficam fora do campo de visão
-  da detecção, mesmo estando visíveis na imagem exibida.
-- O modelo detecta de forma consistente quando o celular está próximo à orelha,
-  mas frequentemente falha quando o aparelho está visível em outras posições
-  (altura do peito, tela voltada para a câmera), mesmo com boa iluminação e sem
-  obstrução. Isso indica que o modelo aprendeu a associar a classe "celular" ao
-  contexto de uso (mão próxima à cabeça) mais do que às características visuais
-  do objeto isoladamente — um viés esperado dado que o dataset de treino
-  provavelmente super-representa essa pose.
-- A qualidade final depende fortemente do dataset (diversidade de cenários, balanceamento de classes e qualidade de anotação).
-- Bounding boxes podem ficar imprecisas em objetos pequenos, movimentos rápidos e enquadramentos fora do padrão de treino.
+## Stack
 
-## ⚠️ Status atual do modelo
+Python 3.10+, OpenCV, NumPy, Edge Impulse Linux SDK (modelo `.eim`), pytest e GitHub Actions.
 
-O modelo `.eim` atual deve ser considerado um **protótipo experimental**.
+## Rodar localmente
 
-- A pipeline de software (captura de webcam, inferência, renderização e tratamento de erros) está funcional.
-- As principais limitações observadas estão concentradas na etapa de treinamento do modelo e na cobertura do dataset, e não na arquitetura geral da aplicação.
-- Dependendo da posição do celular, postura do condutor e condições da cena, a detecção pode ocorrer com baixa confiança ou gerar classificações incorretas.
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt && pip install edge_impulse_linux
+chmod +x model/cellphone_detector.eim
+python -m src.main
+```
 
-## 🧠 Roadmap de melhoria
-
-- Adicionar exemplos de celular em posições variadas (altura do peito, tela
-  voltada para a câmera, parcialmente visível) para reduzir o viés de pose
-  identificado em teste.
-- Expandir o dataset com maior diversidade de iluminação, câmera, ângulos e perfis de condutor.
-- Melhorar a qualidade das anotações para tornar as bounding boxes mais consistentes.
-- Incluir mais exemplos negativos (mão no rosto, objetos parecidos, gestos sem celular) para reduzir falsos positivos.
-- Avaliar outras arquiteturas de object detection e diferentes configurações de treino/export no Edge Impulse.
-- Adotar versionamento de modelos `.eim` com rastreabilidade de métricas por versão (ex.: precisão, recall, FPS).
-
-## Melhorias futuras
-
-- Filtro temporal para reduzir falsos positivos.
-- Export de eventos (timestamp + confiança) em CSV/JSON.
-- Modo headless (sem UI) para edge devices.
-- Testes de integração com mock do runner e testes em hardware real.
-
-## Arquitetura detalhada
-
-Consulte `docs/ARCHITECTURE.md`.
-
-## 🎓 Objetivo do projeto
-
-Este projeto foi construído para demonstrar, de forma prática e profissional:
-
-- Integração entre ML aplicado e engenharia de software.
-- Implementação de pipeline de inferência em tempo real com webcam.
-- Organização arquitetural modular e manutenção de código em camadas.
-- Aplicação de visão computacional em um problema real de segurança no trânsito.
+Para arquivo de vídeo, gravação, profiling e todas as flags, veja [docs/SETUP.md](docs/SETUP.md).
